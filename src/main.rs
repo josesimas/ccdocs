@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 const VIEWER_HTML: &str = include_str!("../viewer.html");
 
 const USAGE: &str = "ccdocs --merge-all [--db merged.db]
-       ccdocs --serve [--db ccdocs.db] [--port 8765]
+       ccdocs --serve [--db FILE] [--port 8765]
        ccdocs --list
-       ccdocs --save-all [--db ccdocs.db] [--computer NAME] [--user NAME]
+       ccdocs --save-all [--db ccdocs-COMPUTER-USER.db] [--computer NAME] [--user NAME]
        ccdocs --group NAME [--groups-file groups.json] [--out DIR]
        ccdocs --cwd PATH --name NAME [--out DIR]
 options:
@@ -75,9 +75,16 @@ fn run() -> Result<(), String> {
         return merge_all(Path::new(a.get("db").map(String::as_str).unwrap_or("merged.db")));
     }
     if serve {
-        let db =a.get("db").map(String::as_str).unwrap_or("ccdocs.db");
+        let db = a.get("db").map(PathBuf::from).unwrap_or_else(|| {
+            let mine = PathBuf::from(default_db_name(&computer_name(), &user_name()));
+            [mine.clone(), "merged.db".into(), "ccdocs.db".into()]
+                .into_iter()
+                .find(|p| p.is_file())
+                .or_else(newest_db)
+                .unwrap_or(mine)
+        });
         let port = a.get("port").map(String::as_str).unwrap_or("8765");
-        return serve_viewer(Path::new(db), port);
+        return serve_viewer(&db, port);
     }
     let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
     let claude_dir = a.get("claude-dir").map(PathBuf::from).unwrap_or_else(|| Path::new(&home).join(".claude"));
@@ -118,11 +125,11 @@ fn run() -> Result<(), String> {
         );
     }
     if save_all {
-        let db = a.get("db").map(String::as_str).unwrap_or("ccdocs.db");
         let computer = a.get("computer").cloned().unwrap_or_else(computer_name);
         let username = a.get("user").cloned().unwrap_or_else(user_name);
+        let db = a.get("db").cloned().unwrap_or_else(|| default_db_name(&computer, &username));
         println!("origin: {username}@{computer}");
-        return save_all_to_db(Path::new(db), a.get("groups-file"), &meta, &jsonls, &computer, &username);
+        return save_all_to_db(Path::new(&db), a.get("groups-file"), &meta, &jsonls, &computer, &username);
     }
 
     let load = |id: &str| -> Option<Session> {
@@ -407,6 +414,21 @@ fn handle_conn(mut stream: std::net::TcpStream, db: &Path) {
         );
         let _ = stream.write_all(head.as_bytes()).and_then(|_| stream.write_all(&body));
     }
+}
+
+/// Default database file name: ccdocs-<computer>-<user>.db
+fn default_db_name(computer: &str, username: &str) -> String {
+    format!("ccdocs-{}-{}.db", sanitize(computer), sanitize(username))
+}
+
+/// Most recently modified *.db in the current folder.
+fn newest_db() -> Option<PathBuf> {
+    fs::read_dir(".")
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("db")))
+        .max_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
 }
 
 fn computer_name() -> String {
