@@ -73,6 +73,7 @@ function el(tag, cls, text) {
   if (text != null) e.textContent = text;
   return e;
 }
+function origin(r) { return r.u || r.pc ? `${r.u || '?'}@${r.pc || '?'}` : 'unknown origin'; }
 function fmtTime(ms) { return ms ? new Date(ms).toLocaleString() : ''; }
 
 async function openDb(file) {
@@ -98,13 +99,13 @@ function refresh() {
 
 function listSessions() {
   const grp = $('#group').value;
-  const rs = rows(`select s.local_id id, s.title, s.group_name g, s.created_at c, s.last_activity_at l,
+  const rs = rows(`select s.local_id id, s.title, s.group_name g, s.created_at c, s.last_activity_at l, s.username u, s.computer pc,
       (select count(*) from messages m where m.local_id = s.local_id) n
       from sessions s ${grp ? 'where s.group_name = ?' : ''} order by coalesce(s.last_activity_at, s.created_at) desc`, grp ? [grp] : []);
   const side = $('#side'); side.replaceChildren();
   for (const r of rs) {
     const it = el('div', 'item' + (current?.id === r.id ? ' sel' : ''));
-    it.append(el('div', 't', r.title || '(untitled)'), el('div', 'm', `${r.g} · ${fmtTime(r.l || r.c)} · ${r.n} msgs`));
+    it.append(el('div', 't', r.title || '(untitled)'), el('div', 'm', `${r.g} · ${origin(r)} · ${fmtTime(r.l || r.c)} · ${r.n} msgs`));
     it.onclick = () => openSession(r.id);
     side.append(it);
   }
@@ -159,7 +160,7 @@ function openSession(id, focusUuid) {
   const s = rows('select * from sessions where local_id = ?', [id])[0];
   current = { id };
   const main = $('#main'); main.replaceChildren();
-  main.append(el('h2', null, s.title || '(untitled)'), el('div', 'meta', `${s.group_name} · ${s.cwd} · ${fmtTime(s.created_at)}`));
+  main.append(el('h2', null, s.title || '(untitled)'), el('div', 'meta', `${s.group_name} · ${origin({ u: s.username, pc: s.computer })} · ${s.cwd} · ${fmtTime(s.created_at)}`));
   let target = null;
   const st = db.prepare('select uuid, role, timestamp, content_json from messages where local_id = ? and is_sidechain = 0 order by seq'); st.bind([id]);
   while (st.step()) {

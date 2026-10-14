@@ -13,7 +13,7 @@ const VIEWER_HTML: &str = include_str!("../viewer.html");
 
 const USAGE: &str = "ccdocs --serve [--db ccdocs.db] [--port 8765]
        ccdocs --list
-       ccdocs --save-all [--db ccdocs.db]
+       ccdocs --save-all [--db ccdocs.db] [--computer NAME] [--user NAME]
        ccdocs --group NAME [--groups-file groups.json] [--out DIR]
        ccdocs --cwd PATH --name NAME [--out DIR]
 options:
@@ -110,7 +110,10 @@ fn run() -> Result<(), String> {
     }
     if save_all {
         let db = a.get("db").map(String::as_str).unwrap_or("ccdocs.db");
-        return save_all_to_db(Path::new(db), a.get("groups-file"), &meta, &jsonls);
+        let computer = a.get("computer").cloned().unwrap_or_else(computer_name);
+        let username = a.get("user").cloned().unwrap_or_else(user_name);
+        println!("origin: {username}@{computer}");
+        return save_all_to_db(Path::new(db), a.get("groups-file"), &meta, &jsonls, &computer, &username);
     }
 
     let load = |id: &str| -> Option<Session> {
@@ -397,12 +400,32 @@ fn handle_conn(mut stream: std::net::TcpStream, db: &Path) {
     }
 }
 
+fn computer_name() -> String {
+    ["COMPUTERNAME", "HOSTNAME"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+        .or_else(|| {
+            let out = std::process::Command::new("hostname").output().ok()?;
+            Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn user_name() -> String {
+    ["USERNAME", "USER", "LOGNAME"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+        .unwrap_or_else(|| "unknown".into())
+}
+
 /// Create or update a SQLite database holding every conversation (re-running upserts by uuid).
 fn save_all_to_db(
     db: &Path,
     groups_file: Option<&String>,
     meta: &HashMap<String, PathBuf>,
     jsonls: &HashMap<String, PathBuf>,
+    computer: &str,
+    username: &str,
 ) -> Result<(), String> {
     let err = |e: rusqlite::Error| e.to_string();
     let mut group_of: HashMap<String, String> = HashMap::new();
@@ -419,7 +442,8 @@ fn save_all_to_db(
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS sessions(
             local_id TEXT PRIMARY KEY, cli_session_id TEXT, title TEXT, cwd TEXT, group_name TEXT,
-            created_at INTEGER, last_activity_at INTEGER, archived INTEGER, transcript_path TEXT, saved_at TEXT);
+            created_at INTEGER, last_activity_at INTEGER, archived INTEGER, transcript_path TEXT, saved_at TEXT,
+            computer TEXT, username TEXT);
          CREATE TABLE IF NOT EXISTS messages(
             uuid TEXT PRIMARY KEY, local_id TEXT NOT NULL REFERENCES sessions(local_id), parent_uuid TEXT,
             seq INTEGER, role TEXT, timestamp TEXT, is_sidechain INTEGER, model TEXT, text TEXT, content_json TEXT);
@@ -427,6 +451,17 @@ fn save_all_to_db(
          CREATE INDEX IF NOT EXISTS sessions_group ON sessions(group_name);",
     )
     .map_err(err)?;
+    // Databases created before origin tracking lack these columns.
+    let cols: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('sessions')")
+        .and_then(|mut s| s.query_map([], |r| r.get(0))?.collect())
+        .map_err(err)?;
+    for c in ["computer", "username"] {
+        if !cols.iter().any(|x| x == c) {
+            conn.execute(&format!("ALTER TABLE sessions ADD COLUMN {c} TEXT"), []).map_err(err)?;
+        }
+    }
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS sessions_origin ON sessions(computer, username)").map_err(err)?;
 
     let (mut n_sessions, mut n_msgs) = (0, 0);
     for (id, mpath) in meta {
@@ -439,7 +474,9 @@ fn save_all_to_db(
         let text = fs::read_to_string(jpath).map_err(|e| format!("{}: {e}", jpath.display()))?;
         let tx = conn.transaction().map_err(err)?;
         tx.execute(
-            "INSERT OR REPLACE INTO sessions VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,datetime('now'))",
+            "INSERT OR REPLACE INTO sessions(local_id, cli_session_id, title, cwd, group_name, created_at,
+                last_activity_at, archived, transcript_path, saved_at, computer, username)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,datetime('now'),?10,?11)",
             rusqlite::params![
                 id,
                 cli,
@@ -450,6 +487,8 @@ fn save_all_to_db(
                 v["lastActivityAt"].as_i64(),
                 v["isArchived"].as_bool().unwrap_or(false),
                 jpath.to_string_lossy(),
+                computer,
+                username,
             ],
         )
         .map_err(err)?;
