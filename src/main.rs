@@ -501,6 +501,15 @@ fn save_all_to_db(
 /// the app see it at %APPDATA%\Claude, so a normal shell has to look in the package folder.
 fn find_app_dir() -> PathBuf {
     let has_sessions = |d: &Path| fs::read_dir(d.join("claude-code-sessions")).is_ok_and(|mut r| r.next().is_some());
+    let home = std::env::var("HOME").unwrap_or_default();
+    let unix_default = if cfg!(target_os = "macos") {
+        Path::new(&home).join("Library/Application Support/Claude")
+    } else {
+        Path::new(&home).join(".config/Claude")
+    };
+    if !cfg!(windows) {
+        return unix_default;
+    }
     let default = Path::new(&std::env::var("APPDATA").unwrap_or_default()).join("Claude");
     if has_sessions(&default) {
         return default;
