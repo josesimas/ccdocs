@@ -9,7 +9,8 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const USAGE: &str = "ccdocs --group NAME [--groups-file groups.json] [--out DIR]
+const USAGE: &str = "ccdocs --list
+       ccdocs --group NAME [--groups-file groups.json] [--out DIR]
        ccdocs --cwd PATH --name NAME [--out DIR]
 options:
   --group NAME         group name, looked up in the groups file (id list per group)
@@ -38,8 +39,13 @@ fn main() {
 fn run() -> Result<(), String> {
     let mut a: HashMap<String, String> = HashMap::new();
     let mut it = std::env::args().skip(1);
+    let mut list = false;
     while let Some(k) = it.next() {
         let k = k.strip_prefix("--").ok_or(format!("unexpected argument {k}"))?.to_string();
+        if k == "list" {
+            list = true;
+            continue;
+        }
         a.insert(k.clone(), it.next().ok_or(format!("--{k} needs a value"))?);
     }
     let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
@@ -57,6 +63,9 @@ fn run() -> Result<(), String> {
             }
         }
     });
+    if list {
+        return list_groups(a.get("groups-file"), &meta);
+    }
     let mut jsonls: HashMap<String, PathBuf> = HashMap::new();
     if let Ok(rd) = fs::read_dir(claude_dir.join("projects")) {
         for d in rd.flatten() {
@@ -307,6 +316,27 @@ fn fmt_ms(ms: i64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + (m <= 2) as i64;
     format!("{y:04}-{m:02}-{d:02} {:02}:{:02} UTC", rem / 3600, rem % 3600 / 60)
+}
+
+/// Print every group in the groups file with its session count, plus the implicit "Ungrouped".
+fn list_groups(explicit: Option<&String>, meta: &HashMap<String, PathBuf>) -> Result<(), String> {
+    let mut listed = std::collections::HashSet::new();
+    match find_groups_file(explicit) {
+        Some(p) => {
+            let j: Value = serde_json::from_str(&fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?)
+                .map_err(|e| format!("{}: {e}", p.display()))?;
+            for (name, ids) in j.as_object().ok_or("groups file must be a JSON object")? {
+                let ids: Vec<&str> = ids.as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                let present = ids.iter().filter(|id| meta.contains_key(**id)).count();
+                println!("{name}  ({present} of {} sessions found)", ids.len());
+                listed.extend(ids.into_iter().map(String::from));
+            }
+        }
+        None => eprintln!("(no groups.json found; only Ungrouped is available)"),
+    }
+    let ungrouped = meta.keys().filter(|id| !listed.contains(*id)).count();
+    println!("Ungrouped  ({ungrouped} sessions, every session not in a group above)");
+    Ok(())
 }
 
 /// Explicit path, else groups.json in the current folder, next to the exe, or in a parent of either.
