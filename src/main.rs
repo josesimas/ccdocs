@@ -11,9 +11,10 @@ use std::path::{Path, PathBuf};
 
 const VIEWER_HTML: &str = include_str!("../viewer.html");
 
-const USAGE: &str = "ccdocs --serve [--db ccdocs.db] [--port 8765]
+const USAGE: &str = "ccdocs --merge-all [--db merged.db]
+       ccdocs --serve [--db FILE] [--port 8765]
        ccdocs --list
-       ccdocs --save-all [--db ccdocs.db] [--computer NAME] [--user NAME]
+       ccdocs --save-all [--db ccdocs-COMPUTER-USER.db] [--computer NAME] [--user NAME]
        ccdocs --group NAME [--groups-file groups.json] [--out DIR]
        ccdocs --cwd PATH --name NAME [--out DIR]
 options:
@@ -46,6 +47,7 @@ fn run() -> Result<(), String> {
     let mut list = false;
     let mut save_all = false;
     let mut serve = false;
+    let mut merge = false;
     while let Some(k) = it.next() {
         let k = k.strip_prefix("--").ok_or(format!("unexpected argument {k}"))?.to_string();
         match k.as_str() {
@@ -57,6 +59,10 @@ fn run() -> Result<(), String> {
                 save_all = true;
                 continue;
             }
+            "merge-all" => {
+                merge = true;
+                continue;
+            }
             "serve" => {
                 serve = true;
                 continue;
@@ -65,10 +71,20 @@ fn run() -> Result<(), String> {
         }
         a.insert(k.clone(), it.next().ok_or(format!("--{k} needs a value"))?);
     }
+    if merge {
+        return merge_all(Path::new(a.get("db").map(String::as_str).unwrap_or("merged.db")));
+    }
     if serve {
-        let db = a.get("db").map(String::as_str).unwrap_or("ccdocs.db");
+        let db = a.get("db").map(PathBuf::from).unwrap_or_else(|| {
+            let mine = PathBuf::from(default_db_name(&computer_name(), &user_name()));
+            [mine.clone(), "merged.db".into(), "ccdocs.db".into()]
+                .into_iter()
+                .find(|p| p.is_file())
+                .or_else(newest_db)
+                .unwrap_or(mine)
+        });
         let port = a.get("port").map(String::as_str).unwrap_or("8765");
-        return serve_viewer(Path::new(db), port);
+        return serve_viewer(&db, port);
     }
     let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
     let claude_dir = a.get("claude-dir").map(PathBuf::from).unwrap_or_else(|| Path::new(&home).join(".claude"));
@@ -110,11 +126,11 @@ fn run() -> Result<(), String> {
         );
     }
     if save_all {
-        let db = a.get("db").map(String::as_str).unwrap_or("ccdocs.db");
         let computer = a.get("computer").cloned().unwrap_or_else(computer_name);
         let username = a.get("user").cloned().unwrap_or_else(user_name);
+        let db = a.get("db").cloned().unwrap_or_else(|| default_db_name(&computer, &username));
         println!("origin: {username}@{computer}");
-        return save_all_to_db(Path::new(db), groups.as_ref(), &meta, &jsonls, &computer, &username);
+        return save_all_to_db(Path::new(&db), groups.as_ref(), &meta, &jsonls, &computer, &username);
     }
 
     let load = |id: &str| -> Option<Session> {
@@ -399,6 +415,21 @@ fn handle_conn(mut stream: std::net::TcpStream, db: &Path) {
     }
 }
 
+/// Default database file name: ccdocs-<computer>-<user>.db
+fn default_db_name(computer: &str, username: &str) -> String {
+    format!("ccdocs-{}-{}.db", sanitize(computer), sanitize(username))
+}
+
+/// Most recently modified *.db in the current folder.
+fn newest_db() -> Option<PathBuf> {
+    fs::read_dir(".")
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("db")))
+        .max_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
+}
+
 fn computer_name() -> String {
     ["COMPUTERNAME", "HOSTNAME"]
         .iter()
@@ -417,25 +448,10 @@ fn user_name() -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-/// Create or update a SQLite database holding every conversation (re-running upserts by uuid).
-fn save_all_to_db(
-    db: &Path,
-    groups: Option<&(String, Value)>,
-    meta: &HashMap<String, PathBuf>,
-    jsonls: &HashMap<String, PathBuf>,
-    computer: &str,
-    username: &str,
-) -> Result<(), String> {
+/// Open (creating or upgrading) a ccdocs database.
+fn open_db(db: &Path) -> Result<rusqlite::Connection, String> {
     let err = |e: rusqlite::Error| e.to_string();
-    let mut group_of: HashMap<String, String> = HashMap::new();
-    if let Some((_, j)) = groups {
-        for (name, ids) in j.as_object().ok_or("groups must be a JSON object")? {
-            for id in ids.as_array().into_iter().flatten().filter_map(Value::as_str) {
-                group_of.insert(id.to_string(), name.clone());
-            }
-        }
-    }
-    let mut conn = rusqlite::Connection::open(db).map_err(err)?;
+    let conn = rusqlite::Connection::open(db).map_err(err)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS sessions(
             local_id TEXT PRIMARY KEY, cli_session_id TEXT, title TEXT, cwd TEXT, group_name TEXT,
@@ -459,6 +475,88 @@ fn save_all_to_db(
         }
     }
     conn.execute_batch("CREATE INDEX IF NOT EXISTS sessions_origin ON sessions(computer, username)").map_err(err)?;
+
+    Ok(conn)
+}
+
+/// Merge every *.db in the current folder into `out` (created if missing, updated if present).
+/// Messages are unioned by uuid; for a conversation present in several sources the most
+/// recently saved copy of its session row wins.
+fn merge_all(out: &Path) -> Result<(), String> {
+    let err = |e: rusqlite::Error| e.to_string();
+    let out_abs = fs::canonicalize(out).unwrap_or_else(|_| out.to_path_buf());
+    let mut sources: Vec<PathBuf> = fs::read_dir(".")
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("db")))
+        .filter(|p| fs::canonicalize(p).map_or(true, |c| c != out_abs))
+        .collect();
+    sources.sort();
+    if sources.is_empty() {
+        return Err("no .db files found in the current folder".into());
+    }
+    let conn = open_db(out)?;
+    for src in &sources {
+        let path = src.to_string_lossy().into_owned();
+        conn.execute("ATTACH DATABASE ?1 AS s", [&path]).map_err(err)?;
+        let has = |t: &str| -> bool {
+            conn.query_row("SELECT count(*) FROM s.sqlite_master WHERE type='table' AND name=?1", [t], |r| r.get::<_, i64>(0))
+                .map_or(false, |n| n > 0)
+        };
+        if !has("sessions") || !has("messages") {
+            eprintln!("skipped {path}: not a ccdocs database");
+            conn.execute_batch("DETACH DATABASE s").map_err(err)?;
+            continue;
+        }
+        let scols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('sessions','s')")
+            .and_then(|mut q| q.query_map([], |r| r.get(0))?.collect())
+            .map_err(err)?;
+        let pick = |c: &str| if scols.iter().any(|x| x == c) { c.to_string() } else { "NULL".to_string() };
+        let all = "local_id, cli_session_id, title, cwd, group_name, created_at, last_activity_at, archived, transcript_path, saved_at, computer, username";
+        let sel = all.split(", ").map(pick).collect::<Vec<_>>().join(", ");
+        let upd = all.split(", ").skip(1).map(|c| format!("{c}=excluded.{c}")).collect::<Vec<_>>().join(", ");
+        let before: i64 = conn.query_row("SELECT count(*) FROM main.messages", [], |r| r.get(0)).map_err(err)?;
+        conn.execute_batch(&format!(
+            "BEGIN;
+             INSERT INTO main.sessions({all}) SELECT {sel} FROM s.sessions WHERE true
+               ON CONFLICT(local_id) DO UPDATE SET {upd}
+               WHERE coalesce(excluded.saved_at,'') >= coalesce(sessions.saved_at,'');
+             INSERT OR REPLACE INTO main.messages SELECT * FROM s.messages;
+             COMMIT;"
+        ))
+        .map_err(err)?;
+        let after: i64 = conn.query_row("SELECT count(*) FROM main.messages", [], |r| r.get(0)).map_err(err)?;
+        println!("{path}: +{} new messages", after - before);
+        conn.execute_batch("DETACH DATABASE s").map_err(err)?;
+    }
+    let (ns, nm): (i64, i64) = conn
+        .query_row("SELECT (SELECT count(*) FROM sessions), (SELECT count(*) FROM messages)", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(err)?;
+    println!("merged {} databases -> {}: {ns} conversations, {nm} messages", sources.len(), out.display());
+    Ok(())
+}
+
+/// Create or update a SQLite database holding every conversation (re-running upserts by uuid).
+fn save_all_to_db(
+    db: &Path,
+    groups: Option<&(String, Value)>,
+    meta: &HashMap<String, PathBuf>,
+    jsonls: &HashMap<String, PathBuf>,
+    computer: &str,
+    username: &str,
+) -> Result<(), String> {
+    let err = |e: rusqlite::Error| e.to_string();
+    let mut group_of: HashMap<String, String> = HashMap::new();
+    if let Some((_, j)) = groups {
+        for (name, ids) in j.as_object().ok_or("groups must be a JSON object")? {
+            for id in ids.as_array().into_iter().flatten().filter_map(Value::as_str) {
+                group_of.insert(id.to_string(), name.clone());
+            }
+        }
+    }
+    let mut conn = open_db(db)?;
 
     let (mut n_sessions, mut n_msgs) = (0, 0);
     for (id, mpath) in meta {
