@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ccdocs viewer</title>
+<style>
+:root{--bg:#fff;--fg:#1f2328;--mut:#6b7280;--card:#f6f8fa;--user:#e8f0fe;--bd:#d0d7de;--acc:#0969da;--hit:#fff1a8}
+@media(prefers-color-scheme:dark){:root{--bg:#14161a;--fg:#e6e8eb;--mut:#9aa3ad;--card:#1d2026;--user:#1f2d45;--bd:#333943;--acc:#58a6ff;--hit:#5a4a00}}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,sans-serif;display:flex;flex-direction:column}
+header{display:flex;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--bd);flex-wrap:wrap}
+header h1{font-size:15px;margin:0 8px 0 0}
+input,select,button{font:inherit;color:inherit;background:var(--card);border:1px solid var(--bd);border-radius:6px;padding:5px 8px}
+button{cursor:pointer}button:hover{border-color:var(--acc)}
+#q{flex:1;min-width:180px}
+#info{color:var(--mut);font-size:12px}
+#app{flex:1;display:flex;min-height:0}
+#side{width:380px;max-width:45%;border-right:1px solid var(--bd);overflow:auto}
+#main{flex:1;overflow:auto;padding:12px 16px}
+.item{padding:8px 12px;border-bottom:1px solid var(--bd);cursor:pointer}
+.item:hover,.item.sel{background:var(--card)}
+.item .t{font-weight:600;overflow-wrap:anywhere}
+.item .m{color:var(--mut);font-size:12px}
+.item .snip{font-size:13px;margin-top:2px;overflow-wrap:anywhere}
+mark{background:var(--hit);color:inherit;border-radius:2px}
+.msg{margin:10px 0;padding:8px 12px;border-radius:8px;background:var(--card)}
+.msg.human{background:var(--user)}
+.msg.flash{outline:2px solid var(--acc)}
+.meta{color:var(--mut);font-size:12px}
+.txt{white-space:pre-wrap;overflow-wrap:anywhere}
+pre{overflow:auto;background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:8px;font-size:12px;margin:4px 0}
+details{margin:4px 0}summary{cursor:pointer;color:var(--mut)}
+.think{white-space:pre-wrap;color:var(--mut)}
+img{max-width:100%;border-radius:6px}
+#drop{margin:15vh auto;max-width:460px;text-align:center;color:var(--mut)}
+#drop.over{color:var(--acc)}
+.more{padding:10px;text-align:center}
+@media(max-width:720px){#app{flex-direction:column}#side{width:100%;max-width:none;height:40%;border-right:0;border-bottom:1px solid var(--bd)}}
+</style>
+</head>
+<body>
+<header>
+  <h1>ccdocs</h1>
+  <button id="open">Open database…</button>
+  <input type="file" id="file" accept=".db,.sqlite,.sqlite3" hidden>
+  <select id="group" title="Group"></select>
+  <select id="role" title="Role"><option value="">user + Claude</option><option value="user">user only</option><option value="assistant">Claude only</option></select>
+  <input id="q" type="search" placeholder="Search all messages (words are ANDed)…" disabled>
+  <span id="info"></span>
+</header>
+<div id="app">
+  <div id="side"></div>
+  <div id="main"><div id="drop">Open (or drop here) the <b>ccdocs.db</b> file created by <code>ccdocs --save-all</code>.<br>Nothing is uploaded; the database is read inside this page.</div></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+const PAGE = 100;
+let db = null, SQL = null, current = null, hits = [], shown = 0, terms = [];
+
+const sqlReady = initSqlJs({ locateFile: f => 'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/' + f });
+
+function rows(sql, params = []) {
+  const st = db.prepare(sql); st.bind(params);
+  const out = []; while (st.step()) out.push(st.getAsObject()); st.free(); return out;
+}
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+function fmtTime(ms) { return ms ? new Date(ms).toLocaleString() : ''; }
+
+async function openDb(file) {
+  try {
+    SQL = await sqlReady;
+    db = new SQL.Database(new Uint8Array(await file.arrayBuffer()));
+    rows('select count(*) c from messages');
+  } catch (e) { alert('Not a ccdocs database: ' + e.message); db = null; return; }
+  const g = $('#group'); g.replaceChildren(new Option('All groups', ''));
+  rows('select group_name g, count(*) c from sessions group by 1 order by 1').forEach(r => g.add(new Option(`${r.g} (${r.c})`, r.g)));
+  $('#q').disabled = false; $('#q').focus();
+  const n = rows('select (select count(*) from sessions) s, (select count(*) from messages) m')[0];
+  $('#info').textContent = `${file.name}: ${n.s} conversations, ${n.m} messages`;
+  $('#main').replaceChildren(el('div', null, 'Pick a conversation, or search.'));
+  refresh();
+}
+
+function refresh() {
+  if (!db) return;
+  terms = $('#q').value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  terms.length ? search() : listSessions();
+}
+
+function listSessions() {
+  const grp = $('#group').value;
+  const rs = rows(`select s.local_id id, s.title, s.group_name g, s.created_at c, s.last_activity_at l,
+      (select count(*) from messages m where m.local_id = s.local_id) n
+      from sessions s ${grp ? 'where s.group_name = ?' : ''} order by coalesce(s.last_activity_at, s.created_at) desc`, grp ? [grp] : []);
+  const side = $('#side'); side.replaceChildren();
+  for (const r of rs) {
+    const it = el('div', 'item' + (current?.id === r.id ? ' sel' : ''));
+    it.append(el('div', 't', r.title || '(untitled)'), el('div', 'm', `${r.g} · ${fmtTime(r.l || r.c)} · ${r.n} msgs`));
+    it.onclick = () => openSession(r.id);
+    side.append(it);
+  }
+}
+
+function search() {
+  const grp = $('#group').value, role = $('#role').value;
+  const where = terms.map(() => `m.text like ? escape '\\'`);
+  const params = terms.map(t => '%' + t.replace(/[\\%_]/g, '\\$&') + '%');
+  if (grp) { where.push('s.group_name = ?'); params.push(grp); }
+  if (role) { where.push('m.role = ?'); params.push(role); }
+  hits = rows(`select m.uuid, m.local_id id, m.role, m.timestamp ts, m.text, s.title, s.group_name g
+      from messages m join sessions s using(local_id)
+      where m.is_sidechain = 0 and ${where.join(' and ')} order by m.timestamp desc`, params);
+  shown = 0;
+  $('#side').replaceChildren();
+  $('#info').textContent = `${hits.length} matching messages`;
+  showMoreHits();
+}
+
+function snippet(text) {
+  const low = text.toLowerCase();
+  let at = Math.min(...terms.map(t => { const i = low.indexOf(t); return i < 0 ? 1e9 : i; }));
+  if (at === 1e9) at = 0;
+  const start = Math.max(0, at - 60);
+  return (start ? '…' : '') + text.slice(start, start + 220).replace(/\s+/g, ' ');
+}
+function highlight(node, text) {
+  if (!terms.length) { node.textContent = text; return; }
+  const re = new RegExp('(' + terms.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')', 'gi');
+  text.split(re).forEach((part, i) => node.append(i % 2 ? Object.assign(el('mark'), { textContent: part }) : document.createTextNode(part)));
+}
+
+function showMoreHits() {
+  const side = $('#side');
+  side.querySelector('.more')?.remove();
+  for (const h of hits.slice(shown, shown + PAGE)) {
+    const it = el('div', 'item');
+    it.append(el('div', 't', h.title || '(untitled)'), el('div', 'm', `${h.g} · ${h.role === 'user' ? 'You' : 'Claude'} · ${h.ts?.slice(0, 16).replace('T', ' ')}`));
+    const sn = el('div', 'snip'); highlight(sn, snippet(h.text)); it.append(sn);
+    it.onclick = () => { side.querySelectorAll('.sel').forEach(x => x.classList.remove('sel')); it.classList.add('sel'); openSession(h.id, h.uuid); };
+    side.append(it);
+  }
+  shown = Math.min(hits.length, shown + PAGE);
+  if (shown < hits.length) {
+    const b = el('button', null, `Show more (${hits.length - shown} left)`);
+    const w = el('div', 'more'); w.append(b); b.onclick = showMoreHits; side.append(w);
+  }
+}
+
+function openSession(id, focusUuid) {
+  const s = rows('select * from sessions where local_id = ?', [id])[0];
+  current = { id };
+  const main = $('#main'); main.replaceChildren();
+  main.append(el('h2', null, s.title || '(untitled)'), el('div', 'meta', `${s.group_name} · ${s.cwd} · ${fmtTime(s.created_at)}`));
+  let target = null;
+  const st = db.prepare('select uuid, role, timestamp, content_json from messages where local_id = ? and is_sidechain = 0 order by seq'); st.bind([id]);
+  while (st.step()) {
+    const m = st.getAsObject();
+    let content; try { content = JSON.parse(m.content_json); } catch { content = m.content_json; }
+    const body = renderContent(content);
+    if (!body.childNodes.length) continue;
+    const isResult = m.role === 'user' && body.querySelector('.result');
+    const box = el('div', 'msg' + (m.role === 'user' && !isResult ? ' human' : ''));
+    box.append(el('div', 'meta', (isResult ? 'Tool result' : m.role === 'user' ? 'You' : 'Claude') + ' · ' + (m.timestamp || '')), body);
+    if (terms.length && !isResult) box.querySelectorAll('.txt').forEach(t => { const tx = t.textContent; t.textContent = ''; highlight(t, tx); });
+    if (m.uuid === focusUuid) target = box;
+    main.append(box);
+  }
+  st.free();
+  if (target) { target.classList.add('flash'); target.scrollIntoView({ block: 'center' }); } else main.scrollTop = 0;
+  if (!terms.length) listSessions();
+}
+
+function renderContent(c) {
+  const out = document.createDocumentFragment ? el('div') : null;
+  const blocks = typeof c === 'string' ? [{ type: 'text', text: c }] : Array.isArray(c) ? c : [];
+  for (const b of blocks) renderBlock(b, out);
+  return out;
+}
+function pre(text, max = 4000) {
+  const p = el('pre'); p.textContent = text.length > max ? text.slice(0, max) + `\n… [${text.length - max} more chars]` : text; return p;
+}
+function renderBlock(b, out) {
+  switch (b.type) {
+    case 'text': if (b.text?.trim()) out.append(el('div', 'txt', b.text.trim())); break;
+    case 'thinking': if (b.thinking) { const d = el('details'); d.append(el('summary', null, 'Thinking'), el('div', 'think', b.thinking)); out.append(d); } break;
+    case 'tool_use': { const d = el('details'); d.append(el('summary', null, 'Tool: ' + b.name), pre(JSON.stringify(b.input, null, 2))); out.append(d); break; }
+    case 'tool_result': {
+      const d = el('details', 'result'); d.append(el('summary', null, 'Result' + (b.is_error ? ' (error)' : '')));
+      if (typeof b.content === 'string') d.append(pre(b.content));
+      else for (const x of b.content || []) x.type === 'text' ? d.append(pre(x.text || '')) : renderBlock(x, d);
+      out.append(d); break;
+    }
+    case 'image': if (b.source?.data) { const i = el('img'); i.src = `data:${b.source.media_type};base64,${b.source.data}`; out.append(i); } break;
+  }
+}
+
+// Served by `ccdocs --serve`: load the database automatically.
+if (location.protocol.startsWith('http')) {
+  fetch('/ccdocs.db').then(r => r.ok ? r.blob() : Promise.reject()).then(b => openDb(new File([b], 'ccdocs.db'))).catch(() => {});
+}
+$('#open').onclick = () => $('#file').click();
+$('#file').onchange = e => e.target.files[0] && openDb(e.target.files[0]);
+let tm; $('#q').oninput = () => { clearTimeout(tm); tm = setTimeout(refresh, 250); };
+$('#group').onchange = $('#role').onchange = refresh;
+const drop = $('#drop');
+['dragover', 'dragenter'].forEach(ev => addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+addEventListener('dragleave', () => drop.classList.remove('over'));
+addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('over'); e.dataTransfer.files[0] && openDb(e.dataTransfer.files[0]); });
+</script>
+</body>
+</html>

@@ -1,0 +1,1 @@
+.\run-debug.bat --serve

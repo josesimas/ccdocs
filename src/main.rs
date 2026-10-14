@@ -9,7 +9,11 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const USAGE: &str = "ccdocs --list
+const VIEWER_HTML: &str = include_str!("../viewer.html");
+
+const USAGE: &str = "ccdocs --serve [--db ccdocs.db] [--port 8765]
+       ccdocs --list
+       ccdocs --save-all [--db ccdocs.db]
        ccdocs --group NAME [--groups-file groups.json] [--out DIR]
        ccdocs --cwd PATH --name NAME [--out DIR]
 options:
@@ -40,19 +44,35 @@ fn run() -> Result<(), String> {
     let mut a: HashMap<String, String> = HashMap::new();
     let mut it = std::env::args().skip(1);
     let mut list = false;
+    let mut save_all = false;
+    let mut serve = false;
     while let Some(k) = it.next() {
         let k = k.strip_prefix("--").ok_or(format!("unexpected argument {k}"))?.to_string();
-        if k == "list" {
-            list = true;
-            continue;
+        match k.as_str() {
+            "list" => {
+                list = true;
+                continue;
+            }
+            "save-all" => {
+                save_all = true;
+                continue;
+            }
+            "serve" => {
+                serve = true;
+                continue;
+            }
+            _ => {}
         }
         a.insert(k.clone(), it.next().ok_or(format!("--{k} needs a value"))?);
     }
+    if serve {
+        let db = a.get("db").map(String::as_str).unwrap_or("ccdocs.db");
+        let port = a.get("port").map(String::as_str).unwrap_or("8765");
+        return serve_viewer(Path::new(db), port);
+    }
     let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
     let claude_dir = a.get("claude-dir").map(PathBuf::from).unwrap_or_else(|| Path::new(&home).join(".claude"));
-    let app_dir = a.get("app-dir").map(PathBuf::from).unwrap_or_else(|| {
-        Path::new(&std::env::var("APPDATA").unwrap_or_default()).join("Claude")
-    });
+    let app_dir = a.get("app-dir").map(PathBuf::from).unwrap_or_else(find_app_dir);
 
     // Index desktop-session metadata (local_<id>.json) and transcripts (<cliSessionId>.jsonl).
     let mut meta: HashMap<String, PathBuf> = HashMap::new();
@@ -78,6 +98,19 @@ fn run() -> Result<(), String> {
                 }
             }
         }
+    }
+    if save_all {
+        eprintln!(
+            "found {} desktop sessions in {}, {} transcripts in {}",
+            meta.len(),
+            app_dir.join("claude-code-sessions").display(),
+            jsonls.len(),
+            claude_dir.join("projects").display()
+        );
+    }
+    if save_all {
+        let db = a.get("db").map(String::as_str).unwrap_or("ccdocs.db");
+        return save_all_to_db(Path::new(db), a.get("groups-file"), &meta, &jsonls);
     }
 
     let load = |id: &str| -> Option<Session> {
@@ -316,6 +349,179 @@ fn fmt_ms(ms: i64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + (m <= 2) as i64;
     format!("{y:04}-{m:02}-{d:02} {:02}:{:02} UTC", rem / 3600, rem % 3600 / 60)
+}
+
+/// Serve the embedded viewer and the database on http://localhost:<port> and open the browser.
+fn serve_viewer(db: &Path, port: &str) -> Result<(), String> {
+    if !db.is_file() {
+        return Err(format!("{} not found; run --save-all first", db.display()));
+    }
+    let listener = std::net::TcpListener::bind(format!("127.0.0.1:{port}")).map_err(|e| format!("port {port}: {e}"))?;
+    let url = format!("http://localhost:{port}/");
+    println!("serving {} at {url} (Ctrl+C to stop)", db.display());
+    let _ = if cfg!(windows) {
+        std::process::Command::new("cmd").args(["/c", "start", "", &url]).spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(&url).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(&url).spawn()
+    };
+    for stream in listener.incoming().flatten() {
+        let db = db.to_path_buf();
+        std::thread::spawn(move || handle_conn(stream, &db));
+    }
+    Ok(())
+}
+
+fn handle_conn(mut stream: std::net::TcpStream, db: &Path) {
+    use std::io::{Read, Write};
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+    {
+        let mut buf = [0u8; 2048];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let path = req.split_whitespace().nth(1).unwrap_or("/").split('?').next().unwrap_or("/");
+        let (status, ctype, body): (&str, &str, Vec<u8>) = match path {
+            "/" | "/viewer.html" => ("200 OK", "text/html; charset=utf-8", VIEWER_HTML.as_bytes().to_vec()),
+            "/ccdocs.db" => match fs::read(db) {
+                Ok(b) => ("200 OK", "application/octet-stream", b),
+                Err(_) => ("500 Internal Server Error", "text/plain", b"cannot read database".to_vec()),
+            },
+            _ => ("404 Not Found", "text/plain", b"not found".to_vec()),
+        };
+        let head = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(head.as_bytes()).and_then(|_| stream.write_all(&body));
+    }
+}
+
+/// Create or update a SQLite database holding every conversation (re-running upserts by uuid).
+fn save_all_to_db(
+    db: &Path,
+    groups_file: Option<&String>,
+    meta: &HashMap<String, PathBuf>,
+    jsonls: &HashMap<String, PathBuf>,
+) -> Result<(), String> {
+    let err = |e: rusqlite::Error| e.to_string();
+    let mut group_of: HashMap<String, String> = HashMap::new();
+    if let Some(p) = find_groups_file(groups_file) {
+        let j: Value = serde_json::from_str(&fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?)
+            .map_err(|e| format!("{}: {e}", p.display()))?;
+        for (name, ids) in j.as_object().ok_or("groups file must be a JSON object")? {
+            for id in ids.as_array().into_iter().flatten().filter_map(Value::as_str) {
+                group_of.insert(id.to_string(), name.clone());
+            }
+        }
+    }
+    let mut conn = rusqlite::Connection::open(db).map_err(err)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sessions(
+            local_id TEXT PRIMARY KEY, cli_session_id TEXT, title TEXT, cwd TEXT, group_name TEXT,
+            created_at INTEGER, last_activity_at INTEGER, archived INTEGER, transcript_path TEXT, saved_at TEXT);
+         CREATE TABLE IF NOT EXISTS messages(
+            uuid TEXT PRIMARY KEY, local_id TEXT NOT NULL REFERENCES sessions(local_id), parent_uuid TEXT,
+            seq INTEGER, role TEXT, timestamp TEXT, is_sidechain INTEGER, model TEXT, text TEXT, content_json TEXT);
+         CREATE INDEX IF NOT EXISTS messages_session ON messages(local_id, seq);
+         CREATE INDEX IF NOT EXISTS sessions_group ON sessions(group_name);",
+    )
+    .map_err(err)?;
+
+    let (mut n_sessions, mut n_msgs) = (0, 0);
+    for (id, mpath) in meta {
+        let Ok(v) = serde_json::from_str::<Value>(&fs::read_to_string(mpath).unwrap_or_default()) else { continue };
+        let Some(cli) = v["cliSessionId"].as_str() else { continue };
+        let Some(jpath) = jsonls.get(cli) else {
+            eprintln!("skipped {id}: transcript not found");
+            continue;
+        };
+        let text = fs::read_to_string(jpath).map_err(|e| format!("{}: {e}", jpath.display()))?;
+        let tx = conn.transaction().map_err(err)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO sessions VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,datetime('now'))",
+            rusqlite::params![
+                id,
+                cli,
+                v["title"].as_str(),
+                v["cwd"].as_str(),
+                group_of.get(id).map_or("Ungrouped", String::as_str),
+                v["createdAt"].as_i64(),
+                v["lastActivityAt"].as_i64(),
+                v["isArchived"].as_bool().unwrap_or(false),
+                jpath.to_string_lossy(),
+            ],
+        )
+        .map_err(err)?;
+        {
+            let mut ins = tx
+                .prepare_cached("INSERT OR REPLACE INTO messages VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)")
+                .map_err(err)?;
+            for (seq, line) in text.lines().enumerate() {
+                let Ok(m) = serde_json::from_str::<Value>(line) else { continue };
+                let (Some(role @ ("user" | "assistant")), Some(uuid)) = (m["type"].as_str(), m["uuid"].as_str()) else {
+                    continue;
+                };
+                let content = &m["message"]["content"];
+                let plain = match content {
+                    Value::String(s) => s.clone(),
+                    Value::Array(bs) => bs
+                        .iter()
+                        .filter(|b| b["type"] == "text")
+                        .filter_map(|b| b["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    _ => String::new(),
+                };
+                ins.execute(rusqlite::params![
+                    uuid,
+                    id,
+                    m["parentUuid"].as_str(),
+                    seq as i64,
+                    role,
+                    m["timestamp"].as_str(),
+                    m["isSidechain"].as_bool().unwrap_or(false),
+                    m["message"]["model"].as_str(),
+                    plain,
+                    content.to_string(),
+                ])
+                .map_err(err)?;
+                n_msgs += 1;
+            }
+        }
+        tx.commit().map_err(err)?;
+        n_sessions += 1;
+    }
+    println!("saved {n_sessions} conversations, {n_msgs} messages -> {}", db.display());
+    Ok(())
+}
+
+/// Locate the Claude desktop data folder. The Store/MSIX build of the app keeps it under
+/// %LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude; only programs started from inside
+/// the app see it at %APPDATA%\Claude, so a normal shell has to look in the package folder.
+fn find_app_dir() -> PathBuf {
+    let has_sessions = |d: &Path| fs::read_dir(d.join("claude-code-sessions")).is_ok_and(|mut r| r.next().is_some());
+    let default = Path::new(&std::env::var("APPDATA").unwrap_or_default()).join("Claude");
+    if has_sessions(&default) {
+        return default;
+    }
+    let packages = Path::new(&std::env::var("LOCALAPPDATA").unwrap_or_default()).join("Packages");
+    if let Ok(rd) = fs::read_dir(packages) {
+        let mut cands: Vec<PathBuf> = rd
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with("Claude_") && !n.contains(' ') // skip hand-made "... - Copy" folders
+            })
+            .map(|e| e.path().join("LocalCache").join("Roaming").join("Claude"))
+            .filter(|d| has_sessions(d))
+            .collect();
+        cands.sort();
+        if let Some(d) = cands.into_iter().next() {
+            return d;
+        }
+    }
+    default
 }
 
 /// Print every group in the groups file with its session count, plus the implicit "Ungrouped".
