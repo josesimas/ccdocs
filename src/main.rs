@@ -18,7 +18,7 @@ const USAGE: &str = "ccdocs --serve [--db ccdocs.db] [--port 8765]
        ccdocs --cwd PATH --name NAME [--out DIR]
 options:
   --group NAME         group name, looked up in the groups file (id list per group)
-  --groups-file FILE   JSON {\"group\": [\"local_<id>\", ...]}   (default: groups.json)
+  --groups-file FILE   JSON {\"group\": [\"local_<id>\", ...]}   (default: groups from the Claude app, else groups.json)
   --cwd PATH           alternative selector: every desktop session started in PATH
   --name NAME          output folder name when using --cwd
   --out DIR            where the group folder is created (default: .)
@@ -83,8 +83,9 @@ fn run() -> Result<(), String> {
             }
         }
     });
+    let groups = load_groups(a.get("groups-file"), &app_dir)?;
     if list {
-        return list_groups(a.get("groups-file"), &meta);
+        return list_groups(groups.as_ref(), &meta);
     }
     let mut jsonls: HashMap<String, PathBuf> = HashMap::new();
     if let Ok(rd) = fs::read_dir(claude_dir.join("projects")) {
@@ -113,7 +114,7 @@ fn run() -> Result<(), String> {
         let computer = a.get("computer").cloned().unwrap_or_else(computer_name);
         let username = a.get("user").cloned().unwrap_or_else(user_name);
         println!("origin: {username}@{computer}");
-        return save_all_to_db(Path::new(db), a.get("groups-file"), &meta, &jsonls, &computer, &username);
+        return save_all_to_db(Path::new(db), groups.as_ref(), &meta, &jsonls, &computer, &username);
     }
 
     let load = |id: &str| -> Option<Session> {
@@ -129,12 +130,10 @@ fn run() -> Result<(), String> {
     };
 
     let (group, mut sessions) = if let Some(g) = a.get("group") {
-        let gf = find_groups_file(a.get("groups-file"));
-        let j: Value = match &gf {
-            Some(p) => serde_json::from_str(&fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?)
-                .map_err(|e| format!("{}: {e}", p.display()))?,
+        let j: Value = match &groups {
+            Some((_, j)) => j.clone(),
             None if g == "Ungrouped" => Value::Null,
-            None => return Err("groups.json not found (looked in the current folder, next to the exe and up to 4 parents); use --groups-file".into()),
+            None => return Err("no groups found in the Claude app config or groups.json; use --groups-file".into()),
         };
         let mut ss = vec![];
         if g == "Ungrouped" && j.get(g).is_none() {
@@ -421,7 +420,7 @@ fn user_name() -> String {
 /// Create or update a SQLite database holding every conversation (re-running upserts by uuid).
 fn save_all_to_db(
     db: &Path,
-    groups_file: Option<&String>,
+    groups: Option<&(String, Value)>,
     meta: &HashMap<String, PathBuf>,
     jsonls: &HashMap<String, PathBuf>,
     computer: &str,
@@ -429,10 +428,8 @@ fn save_all_to_db(
 ) -> Result<(), String> {
     let err = |e: rusqlite::Error| e.to_string();
     let mut group_of: HashMap<String, String> = HashMap::new();
-    if let Some(p) = find_groups_file(groups_file) {
-        let j: Value = serde_json::from_str(&fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?)
-            .map_err(|e| format!("{}: {e}", p.display()))?;
-        for (name, ids) in j.as_object().ok_or("groups file must be a JSON object")? {
+    if let Some((_, j)) = groups {
+        for (name, ids) in j.as_object().ok_or("groups must be a JSON object")? {
             for id in ids.as_array().into_iter().flatten().filter_map(Value::as_str) {
                 group_of.insert(id.to_string(), name.clone());
             }
@@ -573,24 +570,65 @@ fn find_app_dir() -> PathBuf {
 }
 
 /// Print every group in the groups file with its session count, plus the implicit "Ungrouped".
-fn list_groups(explicit: Option<&String>, meta: &HashMap<String, PathBuf>) -> Result<(), String> {
+fn list_groups(groups: Option<&(String, Value)>, meta: &HashMap<String, PathBuf>) -> Result<(), String> {
     let mut listed = std::collections::HashSet::new();
-    match find_groups_file(explicit) {
-        Some(p) => {
-            let j: Value = serde_json::from_str(&fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?)
-                .map_err(|e| format!("{}: {e}", p.display()))?;
-            for (name, ids) in j.as_object().ok_or("groups file must be a JSON object")? {
+    match groups {
+        Some((src, j)) => {
+            eprintln!("(groups from {src})");
+            for (name, ids) in j.as_object().ok_or("groups must be a JSON object")? {
                 let ids: Vec<&str> = ids.as_array().into_iter().flatten().filter_map(Value::as_str).collect();
                 let present = ids.iter().filter(|id| meta.contains_key(**id)).count();
                 println!("{name}  ({present} of {} sessions found)", ids.len());
                 listed.extend(ids.into_iter().map(String::from));
             }
         }
-        None => eprintln!("(no groups.json found; only Ungrouped is available)"),
+        None => eprintln!("(no groups found; only Ungrouped is available)"),
     }
     let ungrouped = meta.keys().filter(|id| !listed.contains(*id)).count();
     println!("Ungrouped  ({ungrouped} sessions, every session not in a group above)");
     Ok(())
+}
+
+/// Groups as {name: [local_<id>, ...]} plus a label for where they came from. An explicit
+/// --groups-file wins, then the groups defined in the Claude desktop app's own sidebar
+/// (claude_desktop_config.json), then a groups.json found next to the exe or cwd.
+fn load_groups(explicit: Option<&String>, app_dir: &Path) -> Result<Option<(String, Value)>, String> {
+    let read = |p: &Path| -> Result<Value, String> {
+        serde_json::from_str(&fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?)
+            .map_err(|e| format!("{}: {e}", p.display()))
+    };
+    if let Some(p) = explicit {
+        return Ok(Some((p.clone(), read(Path::new(p))?)));
+    }
+    if let Some(j) = app_groups(&app_dir.join("claude_desktop_config.json")) {
+        return Ok(Some(("Claude app config".into(), j)));
+    }
+    match find_groups_file(None) {
+        Some(p) => Ok(Some((p.display().to_string(), read(&p)?))),
+        None => Ok(None),
+    }
+}
+
+/// Sidebar groups from preferences.epitaxyPrefs["dframe-group-scopes"]: per account/org scope,
+/// `groups: [{id, name}]` and `assignments: {"code:local_<id>": groupId}`.
+fn app_groups(cfg: &Path) -> Option<Value> {
+    let v: Value = serde_json::from_str(&fs::read_to_string(cfg).ok()?).ok()?;
+    let scopes = v["preferences"]["epitaxyPrefs"]["dframe-group-scopes"].as_object()?;
+    let mut out = serde_json::Map::new();
+    for scope in scopes.values() {
+        let mut ids_of: HashMap<&str, Vec<Value>> = HashMap::new();
+        for (key, gid) in scope["assignments"].as_object()? {
+            if let (Some(id), Some(gid)) = (key.strip_prefix("code:"), gid.as_str()) {
+                ids_of.entry(gid).or_default().push(id.into());
+            }
+        }
+        for g in scope["groups"].as_array()? {
+            let (Some(gid), Some(name)) = (g["id"].as_str(), g["name"].as_str()) else { continue };
+            let e = out.entry(name.to_string()).or_insert_with(|| Value::Array(vec![]));
+            e.as_array_mut()?.extend(ids_of.remove(gid).unwrap_or_default());
+        }
+    }
+    (!out.is_empty()).then_some(Value::Object(out))
 }
 
 /// Explicit path, else groups.json in the current folder, next to the exe, or in a parent of either.
